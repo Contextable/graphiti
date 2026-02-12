@@ -1,15 +1,142 @@
 """
 TripIt Pydantic Entity and Edge Type Definitions for Graphiti
+=============================================================
 
 These models define entity types (node categories) and edge types (relationship categories)
 derived from the TripIt API v1 data model (https://tripit.github.io/api/doc/v1). They are
-designed to be passed to Graphiti's add_episode() or add_episode_bulk() methods at
-configuration/initialization time.
+designed to be passed to Graphiti's add_episode() or add_episode_bulk() methods.
 
 Entity types guide the LLM in classifying extracted entities. Edge types and the edge type
 map constrain and classify the relationships the LLM extracts between entities.
 
-Usage:
+
+GRAPHITI INTEGRATION NOTES (for implementors)
+----------------------------------------------
+
+1. Per-Call Parameters (Not Instance-Level Configuration)
+   Entity types, edge types, and the edge type map are NOT stored on the Graphiti instance.
+   They are parameters on every add_episode() and add_episode_bulk() call. There is no
+   one-time registration at initialization. The caller must pass these dicts on every
+   ingestion call.
+
+   The Graphiti constructor signature is:
+       Graphiti(uri, user, password, llm_client, embedder, cross_encoder,
+               store_raw_episode_content, graph_driver, max_coroutines)
+   -- no entity_types/edge_types parameters.
+
+2. add_episode() Signature (per-call):
+       async def add_episode(
+           self,
+           name: str,
+           episode_body: str,
+           source_description: str,
+           reference_time: datetime,
+           source: EpisodeType = EpisodeType.message,
+           group_id: str | None = None,
+           uuid: str | None = None,
+           update_communities: bool = False,
+           entity_types: dict[str, type[BaseModel]] | None = None,
+           excluded_entity_types: list[str] | None = None,
+           previous_episode_uuids: list[str] | None = None,
+           edge_types: dict[str, type[BaseModel]] | None = None,
+           edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+           custom_extraction_instructions: str | None = None,
+           saga: str | SagaNode | None = None,
+           saga_previous_episode_uuid: str | None = None,
+       ) -> AddEpisodeResults
+
+3. add_episode_bulk() Signature (per-call):
+       async def add_episode_bulk(
+           self,
+           bulk_episodes: list[RawEpisode],
+           group_id: str | None = None,
+           entity_types: dict[str, type[BaseModel]] | None = None,
+           excluded_entity_types: list[str] | None = None,
+           edge_types: dict[str, type[BaseModel]] | None = None,
+           edge_type_map: dict[tuple[str, str], list[str]] | None = None,
+           custom_extraction_instructions: str | None = None,
+           saga: str | SagaNode | None = None,
+       ) -> AddBulkEpisodeResults
+
+   RawEpisode is:
+       class RawEpisode(BaseModel):
+           name: str
+           uuid: str | None = None
+           content: str
+           source_description: str
+           source: EpisodeType
+           reference_time: datetime
+
+4. Validation on Each Call
+   validate_entity_types() is called at the top of add_episode()/add_episode_bulk().
+   It checks that no field name in any entity type model collides with EntityNode's
+   reserved field names: uuid, name, group_id, labels, created_at, name_embedding,
+   summary, attributes.
+
+5. MCP Server Startup-Time Entity Types
+   The MCP server (mcp_server/) loads entity types at startup from a YAML config file,
+   stores them on the service object (graphiti_service.entity_types), and passes them on
+   every add_memory() -> queue_service.add_episode() -> graphiti_client.add_episode()
+   call. This is NOT a Graphiti framework feature -- it's a convenience pattern in the
+   MCP server that avoids requiring the MCP client to pass types per-call. The MCP server
+   creates empty BaseModel subclasses with only a docstring (no custom fields):
+
+       entity_model = type(entity_type.name, (BaseModel,), {'__doc__': description})
+
+   The MCP server does NOT support edge_types or edge_type_map at all -- only entity_types,
+   and only as name+description pairs (no custom attribute fields).
+
+   A bulk import CLI tool that wants full-fidelity custom types (with fields, edge types,
+   and edge type maps) should follow the same pattern: load the type dicts once at startup,
+   then pass them on every add_episode() or add_episode_bulk() call.
+
+6. Entity Deduplication
+   Graphiti uses application-level deduplication (NO database uniqueness constraints).
+   The database only has non-unique indices on uuid, group_id, name, created_at.
+
+   Three-stage pipeline:
+     a) Exact string match: normalizes names (lowercase + collapse whitespace), checks
+        for exact matches in an index built from candidate nodes.
+     b) Fuzzy match (MinHash + LSH): 3-gram shingling, 32 MinHash permutations, LSH with
+        band size 4. Requires >= 90% Jaccard similarity. Only applies to "high-entropy"
+        names (Shannon entropy >= 1.5, length >= 6 chars, >= 2 tokens).
+     c) LLM judgment: unresolved entities go to the LLM with full context (episode content,
+        previous episodes, entity type descriptions, candidate existing nodes).
+
+   IMPORTANT: Entity type labels are NOT a differentiator in dedup. Two entities with the
+   same name but different type labels are considered duplicates if they refer to the same
+   real-world thing. Types are passed as context to the LLM but not used in exact/fuzzy
+   matching.
+
+   Constants (from graphiti_core/utils/maintenance/dedup_helpers.py):
+     _NAME_ENTROPY_THRESHOLD = 1.5
+     _MIN_NAME_LENGTH = 6
+     _MIN_TOKEN_COUNT = 2
+     _FUZZY_JACCARD_THRESHOLD = 0.9
+     _MINHASH_PERMUTATIONS = 32
+     _MINHASH_BAND_SIZE = 4
+
+7. Current CLI/Server Exposure Gaps
+
+   | Feature              | REST API (server/) | MCP Server         |
+   |----------------------|--------------------|--------------------|
+   | entity_types         | Not exposed        | YAML config only   |
+   | edge_types           | Not exposed        | Not exposed        |
+   | edge_type_map        | Not exposed        | Not exposed        |
+   | excluded_entity_types| Not exposed        | Not exposed        |
+
+   The REST API server's ingestion endpoint hardcodes only basic parameters and does not
+   forward entity_types, edge_types, or edge_type_map to graphiti_client.add_episode().
+
+   The MCP server supports entity_types only as startup config (name+description, no
+   fields). It does not support edge_types or edge_type_map.
+
+   To use these models with full fidelity (custom fields, edge types, edge type maps),
+   the caller must use the core library directly or extend the CLI/server tools to accept
+   and forward these parameters.
+
+
+Usage (direct library call):
     from tripit_entity_types import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP
 
     await graphiti.add_episode(
@@ -17,6 +144,30 @@ Usage:
         episode_body=episode_content,
         source_description='TripIt itinerary data',
         reference_time=datetime.now(timezone.utc),
+        group_id='user_trips',
+        entity_types=ENTITY_TYPES,
+        edge_types=EDGE_TYPES,
+        edge_type_map=EDGE_TYPE_MAP,
+    )
+
+Usage (bulk):
+    from graphiti_core.utils.bulk_utils import RawEpisode
+    from graphiti_core.nodes import EpisodeType
+    from tripit_entity_types import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP
+
+    episodes = [
+        RawEpisode(
+            name='trip_123',
+            content=trip_json,
+            source_description='TripIt API export',
+            source=EpisodeType.json,
+            reference_time=trip_start_date,
+        )
+        for trip_json, trip_start_date in trip_data
+    ]
+
+    await graphiti.add_episode_bulk(
+        bulk_episodes=episodes,
         group_id='user_trips',
         entity_types=ENTITY_TYPES,
         edge_types=EDGE_TYPES,
